@@ -1,0 +1,1304 @@
+# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Create an SSM Automation runbook which will automatically enroll qualified resources into Shield Advanced monitoring
+  in response to AWS API actions or through a scheduled event.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: General Configuration
+        Parameters:
+          - pEventsEIPELBRegions
+          - pEventsRuleSchedule
+    ParameterLabels:
+      pEventsEIPELBRegions:
+        default: EC2 EIP and ELB Load Balancer Regions
+      pEventsRuleSchedule:
+        default: Validation Schedule
+
+Parameters:
+  pEventsEIPELBRegions:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      A comma-separated list of regions where event rules to detect creation of ELB load balancers and EC2 elastic IPs
+      will be deployed.  Additionally, this will constrain the scheduled validation of Shield Advanced enrollment of
+      ELB load balancers and elastic IPs to the specified regions.  Leave blank to instead use all regions that are
+      enabled by default for an AWS account.
+
+  pEventsRuleSchedule:
+    Type: String
+    Default: 0 */4 * * ? *
+    Description: >-
+      The frequency, as a cron statement, in which the SSM Automation runbook will run and validate that existing
+      resources have been enrolled into Shield Advanced monitoring.
+
+Conditions:
+  cUseAllRegions: !Equals [ !Join [ ",", !Ref pEventsEIPELBRegions ], "" ]
+
+Resources:
+  rCloudFormationStackSetEventsAdministrationIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - sts:AssumeRole
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:iam::${ AWS::AccountId }:role/CloudFormationStackSetEventsExecutionIAMRole
+            Version: 2012-10-17
+          PolicyName: CloudFormationStackSetEventsAdministrationIAMRolePolicy
+
+  rCloudFormationStackSetEventsCloudFrontRoute53:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AdministrationRoleARN: !GetAtt rCloudFormationStackSetEventsAdministrationIAMRole.Arn
+      Description: >-
+        Deploys an EventBridge event rule in us-east-1 to capture CloudFront and Route 53 API events for Shield
+        Advanced Automation.
+      ExecutionRoleName: !Ref rCloudFormationStackSetEventsExecutionIAMRole
+      PermissionModel: SELF_MANAGED
+      StackInstancesGroup:
+        -
+          DeploymentTargets:
+            Accounts:
+              - !Ref AWS::AccountId
+          Regions:
+            - us-east-1
+      StackSetName: ShieldAdvancedAutomationCloudFrontRoute53Events
+      TemplateBody: !Sub |-
+        AWSTemplateFormatVersion: 2010-09-09
+        Description: >-
+          Deploys an EventBridge event rule to capture CloudFront and Route 53 API events for Shield Advanced
+          Automation.
+
+        Resources:
+          rEventsRule:
+            Type: AWS::Events::Rule
+            Properties:
+              Description: >-
+                CloudFront CreateDistribution and DeleteDistribution and Route 53 CreateHostedZone and DeleteHostedZone
+                API event rule.
+              EventPattern:
+                detail:
+                  errorCode:
+                    -
+                      exists: false
+                  eventName:
+                    - CreateDistribution
+                    - CreateHostedZone
+                    - DeleteDistribution
+                    - DeleteHostedZone
+                  eventSource:
+                    - cloudfront.amazonaws.com
+                    - route53.amazonaws.com
+                detail-type:
+                  - AWS API Call via CloudTrail
+                source:
+                  - aws.cloudfront
+                  - aws.route53
+              State: ENABLED
+              Targets:
+                -
+                  Arn: ${ rEventsEventBus.Arn }
+                  Id: ShieldAdvancedAutomationCloudFrontRoute53Events
+                  RoleArn: ${ rShieldAdvancedAutomationEventsIAMRole.Arn }
+
+  rCloudFormationStackSetEventsEIPELB:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AdministrationRoleARN: !GetAtt rCloudFormationStackSetEventsAdministrationIAMRole.Arn
+      Description: >-
+        Deploys an EventBridge event rule in the specified regions to capture EC2 EIP and ELB API events for Shield
+        Advanced Automation.
+      ExecutionRoleName: !Ref rCloudFormationStackSetEventsExecutionIAMRole
+      PermissionModel: SELF_MANAGED
+      StackInstancesGroup:
+        -
+          DeploymentTargets:
+            Accounts:
+              - !Ref AWS::AccountId
+          Regions: !If
+            - cUseAllRegions
+            -
+              - ap-northeast-1
+              - ap-northeast-2
+              - ap-northeast-3
+              - ap-south-1
+              - ap-southeast-1
+              - ap-southeast-2
+              - ca-central-1
+              - eu-central-1
+              - eu-north-1
+              - eu-west-1
+              - eu-west-2
+              - eu-west-3
+              - sa-east-1
+              - us-east-1
+              - us-east-2
+              - us-west-1
+              - us-west-2
+            - !Ref pEventsEIPELBRegions
+      StackSetName: ShieldAdvancedAutomationEIPELBEvents
+      TemplateBody: !Sub |-
+        AWSTemplateFormatVersion: 2010-09-09
+        Description:
+          Deploys EventBridge event rules to capture EC2 EIP and ELB API events for Shield Advanced Automation.
+
+        Resources:
+          rEIPEventsRule:
+            Type: AWS::Events::Rule
+            Properties:
+              Description: EC2 EIP AllocateAddress and ReleaseAddress API event rule.
+              EventPattern:
+                detail:
+                  errorCode:
+                    -
+                      exists: false
+                  eventName:
+                    - AllocateAddress
+                    - ReleaseAddress
+                  eventSource:
+                    - ec2.amazonaws.com
+                detail-type:
+                  - AWS API Call via CloudTrail
+                source:
+                  - aws.ec2
+              State: ENABLED
+              Targets:
+                -
+                  Arn: ${ rEventsEventBus.Arn }
+                  Id: ShieldAdvancedAutomationEIPEvents
+                  RoleArn: ${ rShieldAdvancedAutomationEventsIAMRole.Arn }
+
+          rELBEventsRuleCreate:
+            Type: AWS::Events::Rule
+            Properties:
+              Description: EC2 ELB CreateLoadBalancer API event rule.
+              EventPattern:
+                detail:
+                  errorCode:
+                    -
+                      exists: false
+                  eventName:
+                    - CreateLoadBalancer
+                  eventSource:
+                    - elasticloadbalancing.amazonaws.com
+                  requestParameters:
+                    type:
+                      - application
+                detail-type:
+                  - AWS API Call via CloudTrail
+                source:
+                  - aws.elasticloadbalancing
+              State: ENABLED
+              Targets:
+                -
+                  Arn: ${ rEventsEventBus.Arn }
+                  Id: ShieldAdvancedAutomationELBCreateEvents
+                  RoleArn: ${ rShieldAdvancedAutomationEventsIAMRole.Arn }
+
+          rELBEventsRuleDelete:
+            Type: AWS::Events::Rule
+            Properties:
+              Description: EC2 ELB DeleteLoadBalancer API event rule.
+              EventPattern:
+                detail:
+                  errorCode:
+                    -
+                      exists: false
+                  eventName:
+                    - DeleteLoadBalancer
+                  eventSource:
+                    - elasticloadbalancing.amazonaws.com
+                detail-type:
+                  - AWS API Call via CloudTrail
+                source:
+                  - aws.elasticloadbalancing
+              State: ENABLED
+              Targets:
+                -
+                  Arn: ${ rEventsEventBus.Arn }
+                  Id: ShieldAdvancedAutomationELBDeleteEvents
+                  RoleArn: ${ rShieldAdvancedAutomationEventsIAMRole.Arn }
+
+  rCloudFormationStackSetEventsExecutionIAMRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          -
+            id: F3
+            reason:
+              These are the minimum permissions necessary for execution roles used for CloudFormation StackSets.
+              https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-self-managed.html
+          -
+            id: W11
+            reason:
+              These are the minimum permissions necessary for execution roles used for CloudFormation StackSets.
+              https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-self-managed.html
+          -
+            id: W28
+            reason:
+              The resource is named to avoid a circular relationship with the CloudFormation StackSet administration
+              role.
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt rCloudFormationStackSetEventsAdministrationIAMRole.Arn
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - cloudformation:*
+                  - s3:*
+                Effect: Allow
+                Resource: "*"
+              -
+                Action:
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${ AWS::Partition }:events:*:${ AWS::AccountId }:rule/*
+              -
+                Action:
+                  - iam:PassRole
+                Effect: Allow
+                Resource:
+                  - !GetAtt rShieldAdvancedAutomationEventsIAMRole.Arn
+            Version: 2012-10-17
+          PolicyName: CloudFormationStackSetEventsExecutionIAMRolePolicy
+      RoleName: CloudFormationStackSetEventsExecutionIAMRole
+
+  rCloudFormationStackSetEventsGlobalAccelerator:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AdministrationRoleARN: !GetAtt rCloudFormationStackSetEventsAdministrationIAMRole.Arn
+      Description: >-
+        Deploys an EventBridge event rule in us-west-2 to capture Global Accelerator API events for Shield Advanced
+        Automation.
+      ExecutionRoleName: !Ref rCloudFormationStackSetEventsExecutionIAMRole
+      PermissionModel: SELF_MANAGED
+      StackInstancesGroup:
+        -
+          DeploymentTargets:
+            Accounts:
+              - !Ref AWS::AccountId
+          Regions:
+            - us-west-2
+      StackSetName: ShieldAdvancedAutomationGlobalAcceleratorEvents
+      TemplateBody: !Sub |-
+        AWSTemplateFormatVersion: 2010-09-09
+        Description:
+          Deploys an EventBridge event rule to capture Global Accelerator API events for Shield Advanced Automation.
+
+        Resources:
+          rEventsRule:
+            Type: AWS::Events::Rule
+            Properties:
+              Description: Global Accelerator CreateAccelerator and DeleteAccelerator API event rule.
+              EventPattern:
+                detail:
+                  errorCode:
+                    -
+                      exists: false
+                  eventName:
+                    - CreateAccelerator
+                    - DeleteAccelerator
+                  eventSource:
+                    - globalaccelerator.amazonaws.com
+                detail-type:
+                  - AWS API Call via CloudTrail
+                source:
+                  - aws.globalaccelerator
+              State: ENABLED
+              Targets:
+                -
+                  Arn: ${ rEventsEventBus.Arn }
+                  Id: ShieldAdvancedAutomationGlobalAcceleratorEvents
+                  RoleArn: ${ rShieldAdvancedAutomationEventsIAMRole.Arn }
+
+  rShieldAdvancedAutomationEventsIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - events:PutEvents
+                Effect: Allow
+                Resource:
+                  - !GetAtt rEventsEventBus.Arn
+            Version: 2012-10-17
+          PolicyName: CloudFormationStackSetEventsIAMRolePolicy
+
+  rEventsEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: ShieldAdvancedAutomationEventBus
+
+  rEventsEventBusEventsRuleEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Catch-all event to trigger the Shield Advanced SSM Automation runbook.
+      EventBusName: !Ref rEventsEventBus
+      EventPattern:
+        account:
+          - !Ref AWS::AccountId
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }
+          Id: ShieldAdvancedAutomationEvents
+          InputTransformer:
+            InputPathsMap:
+              account: $.account
+              eventName: $.detail.eventName
+              region: $.region
+              requestAcceleratorArn: $.detail.requestParameters.acceleratorArn
+              requestAllocationId: $.detail.requestParameters.allocationId
+              requestId: $.detail.requestParameters.id
+              requestLoadBalancerArn: $.detail.requestParameters.loadBalancerArn
+              responseAcceleratorArn: $.detail.responseElements.accelerator.acceleratorArn
+              responseAcceleratorName: $.detail.responseElements.accelerator.name
+              responseAllocationId: $.detail.responseElements.allocationId
+              responseDistributionArn: $.detail.responseElements.distribution.aRN
+              responseDistributionDomainName: $.detail.responseElements.distribution.domainName
+              responseHostedZoneId: $.detail.responseElements.hostedZone.id
+              responseHostedZoneName: $.detail.responseElements.hostedZone.name
+              responseLoadBalancerArn: $.detail.responseElements.loadBalancers[0].loadBalancerArn
+              responseLoadBalancerName: $.detail.responseElements.loadBalancers[0].loadBalancerName
+              responsePublicIp: $.detail.responseElements.publicIp
+            InputTemplate: |-
+              {
+                "Account": [<account>],
+                "EventName": [<eventName>],
+                "Region": [<region>],
+                "RequestAcceleratorArn": [<requestAcceleratorArn>],
+                "RequestAllocationId": [<requestAllocationId>],
+                "RequestId": [<requestId>],
+                "RequestLoadBalancerArn": [<requestLoadBalancerArn>],
+                "ResponseAcceleratorArn": [<responseAcceleratorArn>],
+                "ResponseAcceleratorName": [<responseAcceleratorName>],
+                "ResponseAllocationId": [<responseAllocationId>],
+                "ResponseDistributionArn": [<responseDistributionArn>],
+                "ResponseDistributionDomainName": [<responseDistributionDomainName>],
+                "ResponseHostedZoneId": [<responseHostedZoneId>],
+                "ResponseHostedZoneName": [<responseHostedZoneName>],
+                "ResponseLoadBalancerArn": [<responseLoadBalancerArn>],
+                "ResponseLoadBalancerName": [<responseLoadBalancerName>],
+                "ResponsePublicIp": [<responsePublicIp>]
+              }
+          RoleArn: !GetAtt rEventsRuleIAMRole.Arn
+
+  rEventsEventBusEventsRuleSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled event to trigger the Shield Advanced SSM Automation runbook.
+      ScheduleExpression: !Sub cron(${ pEventsRuleSchedule })
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }
+          Id: ShieldAdvancedAutomationSchedule
+          InputTransformer:
+            InputPathsMap:
+              account: $.account
+              eventType: $.detail-type
+            InputTemplate: |-
+              {
+                "Account": [<account>],
+                "EventType": [<eventType>]
+              }
+          RoleArn: !GetAtt rEventsRuleIAMRole.Arn
+
+  rEventsRuleIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - ssm:StartAutomationExecution
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }:$DEFAULT
+              -
+                Action:
+                  - iam:PassRole
+                Condition:
+                  StringLikeIfExists:
+                    iam:PassedToService: ssm.amazonaws.com
+                Effect: Allow
+                Resource:
+                  - !GetAtt rSSMDocumentIAMRole.Arn
+            Version: 2012-10-17
+          PolicyName: ShieldAdvancedEventsRuleIAMRolePolicy
+
+  rSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: Enable automatic enrollment of qualified resources into Shield Advanced monitoring.
+        mainSteps:
+          -
+            action: aws:branch
+            description: Determine if the invoking event is scheduled or related to an API action.
+            inputs:
+              Choices:
+                -
+                  NextStep: GetShieldAdvancedProtectionMap
+                  StringEquals: Scheduled Event
+                  Variable: "{{ EventType }}"
+              Default: GetEventResourceArn
+            name: BranchOnEventType
+          -
+            action: aws:executeScript
+            description: Return a map of resource ARN to Shield Advanced protection IDs.
+            inputs:
+              Handler: handler
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                shield_client = boto3_session.client("shield", "us-east-1")
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of resource ARN to Shield Advanced protection IDs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of reasource ARN to protection ID key value pairs.
+                    """
+                    paginator = shield_client.get_paginator("list_protections")
+
+                    protections = {}
+                    for page in paginator.paginate():
+                        protections.update({
+                            protection["ResourceArn"]: protection["Id"]
+                            for protection in page["Protections"]
+                        })
+
+                    return protections
+
+            name: GetShieldAdvancedProtectionMap
+            outputs:
+              -
+                Name: ProtectionMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Return a map of CloudFront domain name to distribution IDs.
+            inputs:
+              Handler: handler
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                cf_client = boto3_session.client("cloudfront", "us-east-1")
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of CloudFront domain name to distribution ARNs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of domain name to distribution ARN key value pairs.
+                    """
+                    paginator = cf_client.get_paginator("list_distributions")
+
+                    distributions = {}
+                    for page in paginator.paginate():
+                        items = page["DistributionList"].get("Items")
+
+                        if items:
+                            distributions.update({
+                                distribution["DomainName"]: distribution["ARN"]
+                                for distribution in items
+                            })
+
+                    for name, resource_arn in list(distributions.items()):
+                        if IGNORE_TAG_CONSTRUCT in cf_client.list_tags_for_resource(
+                            Resource=resource_arn
+                        )["Tags"]["Items"]:
+                            del distributions[name]
+
+                    return distributions
+
+            name: GetCloudFrontResourceMap
+            outputs:
+              -
+                Name: ResourceMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Return a map of EC2 EIP public IPs to allocation IDs.
+            inputs:
+              Handler: handler
+              InputPayload:
+                Account: "{{ Account }}"
+                Regions: !Join [ ",", !Ref pEventsEIPELBRegions ]
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def describe_regions() -> list:
+                    """Return a list of active AWS regions.
+
+                    :param: None
+                    :return: A list of AWS region names.
+                    """
+                    ec2_client = boto3_session.client("ec2")
+
+                    return [
+                        region["RegionName"]
+                        for region in ec2_client.describe_regions()["Regions"]
+                    ]
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of EC2 EIP public IPs to allocation ARNs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of public IP to allocation ARN key value pairs.
+                    """
+                    addresses = {}
+                    regions = [
+                        region.strip() for region in event["Regions"].split(",")
+                    ] if event["Regions"] else describe_regions()
+
+                    for region in regions:
+                        ec2_client = boto3_session.client("ec2", region)
+
+                        for address in ec2_client.describe_addresses()["Addresses"]:
+                            if address.get("Tags") and IGNORE_TAG_CONSTRUCT in address["Tags"]:
+                                continue
+
+                            addresses.update({
+                                address["PublicIp"]: (
+                                    f"arn:aws:ec2:{region}:{event['Account']}:eip-allocation/"
+                                    f"{address['AllocationId']}"
+                                )
+                            })
+
+                    return addresses
+
+            name: GetEIPResourceMap
+            outputs:
+              -
+                Name: ResourceMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Return a map of ELB load balancer names to ARNs.
+            inputs:
+              Handler: handler
+              InputPayload:
+                Regions: !Join [ ",", !Ref pEventsEIPELBRegions ]
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def describe_regions() -> list:
+                    """Return a list of active AWS regions.
+
+                    :param: None
+                    :return: A list of AWS region names.
+                    """
+                    ec2_client = boto3_session.client("ec2")
+
+                    return [
+                        region["RegionName"]
+                        for region in ec2_client.describe_regions()["Regions"]
+                    ]
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of ELB load balancer names to ARNs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of load balancer name to ARN key value pairs.
+                    """
+                    load_balancers = {}
+                    regions = [
+                        region.strip() for region in event["Regions"].split(",")
+                    ] if event["Regions"] else describe_regions()
+
+                    for region in regions:
+                        elb_client = boto3_session.client("elbv2", region)
+                        paginator = elb_client.get_paginator("describe_load_balancers")
+
+                        items = {}
+                        for page in paginator.paginate():
+                            items.update({
+                                elb["LoadBalancerName"]: elb["LoadBalancerArn"]
+                                for elb in page["LoadBalancers"]
+                                if elb["Type"] in ("application")
+                            })
+
+                        for name, resource_arn in list(items.items()):
+                            if IGNORE_TAG_CONSTRUCT in elb_client.describe_tags(
+                                ResourceArns=[resource_arn]
+                            )["TagDescriptions"][0]["Tags"]:
+                                del items[name]
+
+                        load_balancers.update(items)
+
+                    return load_balancers
+
+            name: GetELBResourceMap
+            outputs:
+              -
+                Name: ResourceMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Return a map of Global Accelerator accelerator names to ARNs.
+            inputs:
+              Handler: handler
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                ga_client = boto3_session.client("globalaccelerator", "us-west-2")
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of Global Accelerator accelerator names to ARNs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of accelerator name to ARN key value pairs.
+                    """
+                    paginator = ga_client.get_paginator("list_accelerators")
+
+                    accelerators = {}
+                    for page in paginator.paginate():
+                        accelerators.update({
+                            accelerator["Name"]: accelerator["AcceleratorArn"]
+                            for accelerator in page["Accelerators"]
+                        })
+
+                    for name, resource_arn in list(accelerators.items()):
+                        if IGNORE_TAG_CONSTRUCT in ga_client.list_tags_for_resource(
+                            ResourceArn=resource_arn
+                        )["Tags"]:
+                            del accelerators[name]
+
+                    return accelerators
+
+            name: GetGlobalAcceleratorResourceMap
+            outputs:
+              -
+                Name: ResourceMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Return a map of Route 53 hosted zone names to ARNs.
+            inputs:
+              Handler: handler
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                r53_client = boto3_session.client("route53", "us-east-1")
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def handler(event: dict, context: dict) -> dict:
+                    """Return a map of Global Accelerator accelerator names to ARNs.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: A dict of accelerator name to ARN key value pairs.
+                    """
+                    paginator = r53_client.get_paginator("list_hosted_zones")
+
+                    hosted_zones = {}
+                    for page in paginator.paginate():
+                        hosted_zones.update({
+                            hosted_zone["Name"]: f"arn:aws:route53:::{hosted_zone['Id'][1:]}"
+                            for hosted_zone in page["HostedZones"]
+                        })
+
+                    for name, resource_arn in list(hosted_zones.items()):
+                        if IGNORE_TAG_CONSTRUCT in r53_client.list_tags_for_resource(
+                            ResourceId=resource_arn.split(":")[-1][11:],
+                            ResourceType="hostedzone"
+                        )["ResourceTagSet"]["Tags"]:
+                            del hosted_zones[name]
+
+                    return hosted_zones
+
+            name: GetRoute53ResourceMap
+            outputs:
+              -
+                Name: ResourceMap
+                Selector: $.Payload
+                Type: StringMap
+          -
+            action: aws:executeScript
+            description: Iterate over all the resource maps and enroll resources into Shield Advanced if necessary.
+            inputs:
+              Handler: handler
+              InputPayload:
+                CFResourceMap: "{{ GetCloudFrontResourceMap.ResourceMap }}"
+                EIPResourceMap: "{{ GetEIPResourceMap.ResourceMap }}"
+                ELBResourceMap: "{{ GetELBResourceMap.ResourceMap }}"
+                GAResourceMap: "{{ GetGlobalAcceleratorResourceMap.ResourceMap }}"
+                ProtectionMap: "{{ GetShieldAdvancedProtectionMap.ProtectionMap }}"
+                R53ResourceMap: "{{ GetRoute53ResourceMap.ResourceMap }}"
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                shield_client = boto3_session.client("shield", "us-east-1")
+
+
+                def handler(event: dict, context: dict) -> None:
+                    """Iterate over all the resource maps and enroll resources into Shield
+                    Advanced if necessary.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: None
+                    """
+                    collections = [
+                        event["CFResourceMap"],
+                        event["EIPResourceMap"],
+                        event["ELBResourceMap"],
+                        event["GAResourceMap"],
+                        event["R53ResourceMap"]
+                    ]
+
+                    for collection in collections:
+                        for name, resource_arn in collection.items():
+                            if resource_arn not in event["ProtectionMap"]:
+                                shield_client.create_protection(
+                                    Name=name,
+                                    ResourceArn=resource_arn
+                                )
+
+            isEnd: true
+            name: ValidateResourceProtections
+          -
+            action: aws:executeScript
+            description: Return a consistent ARN for the resource referenced in the relevant API event.
+            inputs:
+              Handler: handler
+              InputPayload:
+                Account: "{{ Account }}"
+                EventName: "{{ EventName }}"
+                Region: "{{ Region }}"
+                RequestAcceleratorArn: "{{ RequestAcceleratorArn }}"
+                RequestAllocationId: "{{ RequestAllocationId }}"
+                RequestLoadBalancerArn: "{{ RequestLoadBalancerArn }}"
+                RequestId: "{{ RequestId }}"
+                ResponseAcceleratorArn: "{{ ResponseAcceleratorArn }}"
+                ResponseAllocationId: "{{ ResponseAllocationId }}"
+                ResponseDistributionArn: "{{ ResponseDistributionArn }}"
+                ResponseHostedZoneId: "{{ ResponseHostedZoneId }}"
+                ResponseLoadBalancerArn: "{{ ResponseLoadBalancerArn }}"
+              Runtime: python3.8
+              Script: |
+                def handler(event: dict, context: dict) -> str:
+                    """Return a consistent ARN for the resource referenced in the relevant API
+                    event.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: The event resource ARN.
+                    """
+                    account = event["Account"]
+                    event_name = event["EventName"]
+                    request_id = event["RequestId"]
+
+                    if event_name in ("AllocateAddress", "ReleaseAddress"):
+                        resource_arn = (
+                            f"arn:aws:ec2:{event['Region']}:{account}:eip-allocation/"
+                            f"{event['RequestAllocationId'] or event['ResponseAllocationId']}"
+                        )
+
+                    elif event_name in ("CreateAccelerator", "DeleteAccelerator"):
+                        resource_arn = (
+                            event["RequestAcceleratorArn"] or event["ResponseAcceleratorArn"]
+                        )
+
+                    elif event_name in ("CreateDistribution", "DeleteDistribution"):
+                        resource_arn = (
+                            event["ResponseDistributionArn"] or
+                            f"arn:aws:cloudfront::{account}:distribution/"
+                            f"{request_id}"
+                        )
+
+                    elif event_name in ("CreateHostedZone", "DeleteHostedZone"):
+                        resource_arn = (
+                            "arn:aws:route53:::hostedzone/"
+                            f"{request_id or event['ResponseHostedZoneId'][12:]}"
+                        )
+
+                    elif event_name in ("CreateLoadBalancer", "DeleteLoadBalancer"):
+                        resource_arn = (
+                            event["RequestLoadBalancerArn"] or event["ResponseLoadBalancerArn"]
+                        )
+
+                    return resource_arn
+
+            name: GetEventResourceArn
+            outputs:
+              -
+                Name: ResourceArn
+                Selector: $.Payload
+                Type: String
+          -
+            action: aws:branch
+            description: Determine the appropriate runbook step based on the invoking API event name.
+            inputs:
+              Choices:
+                -
+                  Or:
+                    -
+                      StringEquals: AllocateAddress
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: CreateAccelerator
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: CreateDistribution
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: CreateHostedZone
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: CreateLoadBalancer
+                      Variable: "{{ EventName }}"
+                  NextStep: ValidateEventResourceTag
+                -
+                  Or:
+                    -
+                      StringEquals: DeleteAccelerator
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: DeleteDistribution
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: DeleteHostedZone
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: DeleteLoadBalancer
+                      Variable: "{{ EventName }}"
+                    -
+                      StringEquals: ReleaseAddress
+                      Variable: "{{ EventName }}"
+                  NextStep: GetShieldAdvancedProtectionId
+            name: BranchOnEventName
+          -
+            action: aws:executeScript
+            description: Validate the event resource does not have a tag to exclude Shield Advanced enrollment.
+            inputs:
+              Handler: handler
+              InputPayload:
+                EventName: "{{ EventName }}"
+                Region: "{{ Region }}"
+                ResponseAllocationId: "{{ ResponseAllocationId }}"
+                ResourceArn: "{{ GetEventResourceArn.ResourceArn }}"
+                ResponseHostedZoneId: "{{ ResponseHostedZoneId }}"
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+
+                IGNORE_TAG_KEY = "exclude_shield_automation"
+                IGNORE_TAG_VALUE = "true"
+                IGNORE_TAG_CONSTRUCT = {
+                    "Key": IGNORE_TAG_KEY,
+                    "Value": IGNORE_TAG_VALUE
+                }
+
+
+                def handler(event: dict, context: dict) -> None:
+                    """Determine if the event resource has been tagged to explicitly exclude
+                    it from Shield Advanced enrollment.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: None
+                    """
+                    event_name = event["EventName"]
+                    region = event["Region"]
+                    resource_arn = event["ResourceArn"]
+
+                    if event_name in ("AllocateAddress"):
+                        ec2_client = boto3_session.client("ec2", region)
+
+                        do_exclude = ec2_client.describe_addresses(
+                            AllocationIds=[event["ResponseAllocationId"]],
+                            Filters=[
+                                {
+                                    "Name": f"tag:{IGNORE_TAG_KEY}",
+                                    "Values": [IGNORE_TAG_VALUE]
+                                }
+                            ]
+                        )["Addresses"]
+
+                    elif event_name in ("CreateAccelerator"):
+                        ga_client = boto3_session.client("globalaccelerator", "us-west-2")
+
+                        do_exclude = IGNORE_TAG_CONSTRUCT in ga_client.list_tags_for_resource(
+                            ResourceArn=resource_arn
+                        )["Tags"]
+
+                    elif event_name in ("CreateDistribution"):
+                        cf_client = boto3_session.client("cloudfront", "us-east-1")
+
+                        do_exclude = IGNORE_TAG_CONSTRUCT in cf_client.list_tags_for_resource(
+                            Resource=resource_arn
+                        )["Tags"]["Items"]
+
+                    elif event_name in ("CreateHostedZone"):
+                        r53_client = boto3_session.client("route53", "us-east-1")
+
+                        do_exclude = IGNORE_TAG_CONSTRUCT in r53_client.list_tags_for_resource(
+                            ResourceId=event["ResponseHostedZoneId"][12:],
+                            ResourceType="hostedzone"
+                        )["ResourceTagSet"]["Tags"]
+
+                    elif event_name in ("CreateLoadBalancer"):
+                        elb_client = boto3_session.client("elbv2", region)
+
+                        do_exclude = IGNORE_TAG_CONSTRUCT in elb_client.describe_tags(
+                            ResourceArns=[resource_arn]
+                        )["TagDescriptions"][0]["Tags"]
+
+                    if do_exclude:
+                        raise Exception("Ignore tag found on resource.")
+
+            name: ValidateEventResourceTag
+          -
+            action: aws:executeScript
+            description: Return a consistent name for the resource referenced in the relevant API event.
+            inputs:
+              Handler: handler
+              InputPayload:
+                EventName: "{{ EventName }}"
+                ResponseAcceleratorName: "{{ ResponseAcceleratorName }}"
+                ResponseDistributionDomainName: "{{ ResponseDistributionDomainName }}"
+                ResponseHostedZoneName: "{{ ResponseHostedZoneName }}"
+                ResponseLoadBalancerName: "{{ ResponseLoadBalancerName }}"
+                ResponsePublicIp: "{{ ResponsePublicIp }}"
+              Runtime: python3.8
+              Script: |
+                def handler(event: dict, context: dict) -> str:
+                    """Return a consistent name for the resource referenced in the relevant API
+                    event.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: The event resource name.
+                    """
+                    event_name = event["EventName"]
+
+                    if event_name in ("AllocateAddress"):
+                        resource_name = event["ResponsePublicIp"]
+
+                    elif event_name in ("CreateAccelerator"):
+                        resource_name = event["ResponseAcceleratorName"]
+
+                    elif event_name in ("CreateDistribution"):
+                        resource_name = event["ResponseDistributionDomainName"]
+
+                    elif event_name in ("CreateHostedZone"):
+                        resource_name = event["ResponseHostedZoneName"]
+
+                    elif event_name in ("CreateLoadBalancer"):
+                        resource_name = event["ResponseLoadBalancerName"]
+
+                    return resource_name
+
+            name: GetEventResourceName
+            outputs:
+              -
+                Name: ResourceName
+                Selector: $.Payload
+                Type: String
+          -
+            action: aws:executeAwsApi
+            description: Enroll the event resource into Shield Advanced.
+            inputs:
+              Api: CreateProtection
+              Name: "{{ GetEventResourceName.ResourceName }}"
+              ResourceArn: "{{ GetEventResourceArn.ResourceArn }}"
+              Service: shield
+            isEnd: true
+            name: EnrollEventResource
+          -
+            action: aws:executeAwsApi
+            description: Return the Shield Advanced protection ID for the event resource.
+            inputs:
+              Api: DescribeProtection
+              ResourceArn: "{{ GetEventResourceArn.ResourceArn }}"
+              Service: shield
+            name: GetShieldAdvancedProtectionId
+            outputs:
+              -
+                Name: ProtectionId
+                Selector: $.Protection.Id
+                Type: String
+          -
+            action: aws:executeAwsApi
+            description: Unenroll the event resource from Shield Advanced.
+            inputs:
+              Api: DeleteProtection
+              ProtectionId: "{{ GetShieldAdvancedProtectionId.ProtectionId }}"
+              Service: shield
+            name: UnenrollEventResource
+        parameters:
+          Account:
+            type: String
+            default: ""
+            description: The AWS Account ID of the emitted API event.
+          AutomationAssumeRole:
+            type: String
+            default: !GetAtt rSSMDocumentIAMRole.Arn
+            description: >-
+              (Required) The ARN of the IAM role that allows SSM Automation to perform actions defined in the runbook
+              on your behalf.
+          EventName:
+            type: String
+            default: ""
+            description: The name of the emitted API event.
+          EventType:
+            type: String
+            default: ""
+            description: The type of event invoking the SSM Automation runbook.
+          Region:
+            type: String
+            default: ""
+            description: The AWS region ID of the emitted API event.
+          RequestAcceleratorArn:
+            type: String
+            default: ""
+            description: The Global Accelerator ARN provided in the request of the emitted API event.
+          RequestAllocationId:
+            type: String
+            default: ""
+            description: The EC2 EIP allocation ID provided in the request of the emitted API event.
+          RequestId:
+            type: String
+            default: ""
+            description: >-
+              The CloudFront distribution ID or Route 53 hosted zone ID provided in the request of the emitted API
+              event.
+          RequestLoadBalancerArn:
+            type: String
+            default: ""
+            description: The ELB load balancer ARN provided in the request of the emitted API event.
+          ResponseAcceleratorArn:
+            type: String
+            default: ""
+            description: The Global Accelerator ARN provided in the response of the emitted API event.
+          ResponseAcceleratorName:
+            type: String
+            default: ""
+            description: The Global Accelerator name provided in the response of the emitted API event.
+          ResponseAllocationId:
+            type: String
+            default: ""
+            description: The EC2 EIP allocation ID provided in the response of the emitted API event.
+          ResponseDistributionArn:
+            type: String
+            default: ""
+            description: The CloudFront distribution ID provided in the response of the emitted API event.
+          ResponseDistributionDomainName:
+            type: String
+            default: ""
+            description: The CloudFront distribution domain name provided in the response of the emitted API event.
+          ResponseHostedZoneId:
+            type: String
+            default: ""
+            description: The Route 53 hosted zone ID provided in the response of the emitted API event.
+          ResponseHostedZoneName:
+            type: String
+            default: ""
+            description: The Route 53 hosted zone name provided in the response of the emitted API event.
+          ResponseLoadBalancerArn:
+            type: String
+            default: ""
+            description: The ELB load balancer ARN provided in the response of the emitted API event.
+          ResponseLoadBalancerName:
+            type: String
+            default: ""
+            description: The ELB load balancer name provided in the response of the emitted API event.
+          ResponsePublicIp:
+            type: String
+            default: ""
+            description: The EC2 EIP public IP provided in the response of the emitted API event.
+        schemaVersion: "0.3"
+      DocumentType: Automation
+      Name: ShieldAdvancedAutomation
+
+  rSSMDocumentIAMRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          -
+            id: W11
+            reason:
+              The rule covers wildcard read actions for a variety of resources across various services to support the
+              function of the steps in the SSM Automation runbook.  The Shield create action does not support
+              resource-level permissions.
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - cloudfront:GetDistribution
+                  - cloudfront:ListDistributions
+                  - cloudfront:ListTagsForResource
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeRegions
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTags
+                  - globalaccelerator:DescribeAccelerator
+                  - globalaccelerator:ListAccelerators
+                  - globalaccelerator:ListTagsForResource
+                  - route53:GetHostedZone
+                  - route53:ListHostedZones
+                  - route53:ListTagsForResource
+                  - shield:CreateProtection
+                  - shield:DescribeProtection
+                  - shield:ListProtections
+                Effect: Allow
+                Resource: "*"
+              -
+                Action:
+                  - shield:DeleteProtection
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${ AWS::Partition }:shield::${ AWS::AccountId }:protection/*
+            Version: 2012-10-17
+          PolicyName: ShieldAdvancedSSMDocumentIAMRolePolicy
