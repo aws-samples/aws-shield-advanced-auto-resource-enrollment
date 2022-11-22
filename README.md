@@ -11,7 +11,7 @@ This pattern provides an automated solution that will respond to resource creati
 2. Use the identified solution template to launch an AWS CloudFormation stack.  The solution is self-contained and has two configuration parameters to provide: a list of regions to monitor for ELB and Elastic IP events and a cron statement to define the schedule the automation will run to periodically validate resources.
 
 3. Monitor new CloudFront, ELB, Elastic IP, Global Accelerator, and Route 53 resource creation and ensure said resources are enrolled into Shield Advanced monitoring.  In the region in which the solution template was deployed:
- * View the EventBridge rules page in the Console and ensure the default event bus is selected.  Identify the schedule rule for the solution (the name will contain some or all of "rEventsEventBusEventsRuleSchedule") and ensure existing resources are enrolled after the next scheduled execution.
+ * View the EventBridge rules Console page in the relevant region (e.g. https://us-east-1.console.aws.amazon.com/events/home?region=us-east-1#/rules) and ensure the default event bus is selected.  Identify the schedule rule for the solution (the name will contain some or all of "rEventsEventBusEventsRuleSchedule") and ensure existing resources are enrolled after the next scheduled execution.
  * To view the automation execution, navigate to the SSM Automation Console page in the relevant region (e.g. https://us-east-1.console.aws.amazon.com/systems-manager/automation?region=us-east-1).
 
 ## Security
